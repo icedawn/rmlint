@@ -117,7 +117,7 @@ static void rm_fmt_json_key_unsafe(FILE *out, const char *key, const char *value
     memset(safe_value, 0, sizeof(safe_value));
 
     if(rm_fmt_json_fix(value, safe_value, sizeof(safe_value)) >= 0) {
-        fprintf(out, " \"%s\": \"%s\"", key, safe_value);
+        fprintf(out, "\"%s\": \"%s\"", key, safe_value);
     }
 }
 
@@ -158,6 +158,8 @@ static void rm_fmt_head(RmSession *session, _U RmFmtHandler *parent, FILE *out) 
             rm_fmt_json_sep(self, out);
             rm_fmt_json_key(out, "args", session->cfg->joined_argv);
             rm_fmt_json_sep(self, out);
+            rm_fmt_json_key_int(out, "progress", 0);  /* Header is always first. */
+            rm_fmt_json_sep(self, out);
             rm_fmt_json_key(out, "checksum_type", rm_digest_type_to_string(session->cfg->checksum_type));
             if(session->hash_seed1 && session->hash_seed2) {
                 rm_fmt_json_sep(self, out);
@@ -179,6 +181,8 @@ static void rm_fmt_foot(_U RmSession *session, _U RmFmtHandler *parent, FILE *ou
         rm_fmt_json_open(self, out);
         {
             rm_fmt_json_key_bool(out, "aborted", rm_session_was_aborted(session));
+            rm_fmt_json_sep(self, out);
+            rm_fmt_json_key_int(out, "progress", 100);  /* Footer is always last. */
             rm_fmt_json_sep(self, out);
             rm_fmt_json_key_int(out, "total_files", session->total_files);
             rm_fmt_json_sep(self, out);
@@ -220,6 +224,14 @@ static void rm_fmt_elem(
         rm_fmt_json_key_int(out, "id", GPOINTER_TO_UINT(file));
         rm_fmt_json_sep(self, out);
         rm_fmt_json_key(out, "type", rm_file_lint_type_to_string(file->lint_type));
+        rm_fmt_json_sep(self, out);
+        rm_fmt_json_key_int(
+                out, "progress", 
+                100 - 100 * (
+                    (gdouble)session->shred_bytes_remaining /
+                    (gdouble)session->shred_bytes_after_preprocess
+                )
+        );
         rm_fmt_json_sep(self, out);
 
         if(file->digest) {

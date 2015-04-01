@@ -317,6 +317,12 @@ typedef struct RmShredDevice {
     /* Pool for the hashing workers */
     GThreadPool *hash_pool;
 
+    /* Pool for the reading process (one at a time) */
+    GThreadPool *read_pool;
+
+    /* Files that are currently processed */
+    GQueue active_files;
+
     /* Return queue for files which have finished the current increment */
     GAsyncQueue *hashed_file_return;
 
@@ -681,6 +687,10 @@ static void rm_shred_hash_factory(RmBuffer *buffer, RmShredDevice *device) {
     rm_buffer_pool_release(device->main->mem_pool, buffer);
 }
 
+
+// TODO
+static void rm_shred_send_file(RmFile *file, RmShredDevice *device);
+
 static RmShredDevice *rm_shred_device_new(gboolean is_rotational, char *disk_name, RmMainTag *main) {
     RmShredDevice *self = g_slice_new0(RmShredDevice);
     self->main = main;
@@ -696,7 +706,11 @@ static RmShredDevice *rm_shred_device_new(gboolean is_rotational, char *disk_nam
     self->hash_pool = rm_util_thread_pool_new(
                           (GFunc)rm_shred_hash_factory, self, 1
                       );
+    self->read_pool  = rm_util_thread_pool_new(
+                          (GFunc)rm_shred_send_file, self, 1
+                      );
 
+    g_queue_init(&self->active_files);
     self->hashed_file_return = g_async_queue_new();
     self->page_size = main->page_size;
 
@@ -713,6 +727,7 @@ static void rm_shred_device_free(RmShredDevice *self) {
 
     g_async_queue_unref(self->hashed_file_return);
     g_thread_pool_free(self->hash_pool, false, false);
+    g_thread_pool_free(self->read_pool, false, false);
     g_queue_free(self->file_queue);
 
     g_free(self->disk_name);
@@ -1656,7 +1671,15 @@ static bool rm_shred_reassign_checksum(RmMainTag *main, RmFile *file) {
     return can_process;
 }
 
-static RmFile *rm_shred_process_file(RmShredDevice *device, RmFile *file) {
+static void rm_shred_send_file(RmFile *file, RmShredDevice *device) {
+    if(SHRED_USE_BUFFERED_READ) {
+        rm_shred_buffered_read_factory(file, device);
+    } else {
+        rm_shred_unbuffered_read_factory(file, device);
+    }
+}
+
+static RmFile *rm_shred_process_file(RmShredDevice *device, RmFile *file, RmFile *next_file) {
     if(file->shred_group->has_only_ext_cksums) {
         rm_shred_adjust_counters(device, 0, -(gint64)file->file_size);
         return file;
@@ -1665,20 +1688,33 @@ static RmFile *rm_shred_process_file(RmShredDevice *device, RmFile *file) {
     /* hash the next increment of the file */
     if(file->is_symlink) {
         rm_shred_readlink_factory(file, device);
-    } else {
-        if(SHRED_USE_BUFFERED_READ) {
-            rm_shred_buffered_read_factory(file, device);
-        } else {
-            rm_shred_unbuffered_read_factory(file, device);
-        }
+        return file;
+    }
 
-        /* TODO: time is spend here waiting for the file to return
-                 while we could already trigger a new file to read.
-                 Maybe bring back the threadpool'd reader from shredder v1?
-        */
+    bool file_pushed = FALSE;
 
-        /* wait until the increment has finished hashing */
+    if(g_queue_find(&device->active_files, file) == NULL) {
+        rm_util_thread_pool_push(device->read_pool, file);
+        g_queue_push_head(&device->active_files, file);
+        file_pushed = TRUE;
+    }
+    if(next_file != NULL && g_queue_find(&device->active_files, next_file) == NULL)  {
+        rm_util_thread_pool_push(device->read_pool, next_file);
+        g_queue_push_head(&device->active_files, next_file);
+        file_pushed = TRUE;
+    }
+
+    /* TODO: time is spend here waiting for the file to return
+             while we could already trigger a new file to read.
+             Maybe bring back the threadpool'd reader from shredder v1?
+    */
+
+    /* wait until the increment has finished hashing */
+    if(file_pushed) {
         file = g_async_queue_pop(device->hashed_file_return);
+        g_queue_remove(&device->active_files, file);
+    } else {
+        g_printerr("OH FUCK\n");
     }
 
     return file;
@@ -1721,29 +1757,39 @@ static void rm_shred_devlist_factory(RmShredDevice *device, RmMainTag *main) {
     /* scheduler for one file at a time, optimised to minimise seeks */
     while(iter && !rm_session_was_aborted(main->session)) {
         RmFile *file = iter->data;
+        RmFile *next_file = NULL;
+        if(iter->next) {
+            next_file = iter->next->data;
+        }
+
         gboolean can_process = true;
 
         RmOff start_offset = file->hash_offset;
 
         /* initialise hash (or recover progressive hash so far) */
-        g_assert(file->shred_group);
         g_mutex_lock(&main->group_lock);
         {
             if (file->digest == NULL) {
                 g_assert(file->shred_group);
-
                 can_process = rm_shred_reassign_checksum(main, file);
+            }
+
+            if(next_file && next_file->digest == NULL) {
+                g_assert(next_file->shred_group);
+                if(rm_shred_reassign_checksum(main, next_file) == false) {
+                    next_file = NULL;
+                }
             }
         }
         g_mutex_unlock(&main->group_lock);
 
         if (can_process) {
-            file = rm_shred_process_file(device, file);
+            file = rm_shred_process_file(device, file, next_file);
 
             if (start_offset == file->hash_offset && file->has_ext_cksum == false) {
                 rm_log_debug(RED"Offset stuck at %"LLU"\n"RESET, start_offset);
-                file->status = RM_FILE_STATE_IGNORE;
                 /* rm_shred_sift will dispose of the file */
+                file->status = RM_FILE_STATE_IGNORE;
             }
 
             if (file->status == RM_FILE_STATE_FRAGMENT) {
@@ -1773,7 +1819,7 @@ static void rm_shred_devlist_factory(RmShredDevice *device, RmMainTag *main) {
         {
             GList *tmp = iter;
             iter = iter->next;
-            g_assert(tmp->data == file);
+            // g_assert(tmp->data == file);
             if (can_process) {
                 /* file has been processed */
                 g_queue_delete_link(device->file_queue, tmp);
